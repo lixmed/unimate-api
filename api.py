@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +13,20 @@ from pydantic import BaseModel, Field
 from scipy import sparse
 from sklearn.metrics import pairwise_distances
 
-from model_utils import extract_flat_features
+from model_utils import (
+    canonicalize_student,
+    extract_user_flat_features,
+    normalize_gender,
+    students_to_transformer_frame,
+    summarize_distance_values,
+)
 
 ARTIFACT_PATH = Path("artifacts/unimate_matcher.joblib")
-FLAT_MODEL_DIR = Path("artifacts/flat_model")
+MODEL_DIR = Path("artifacts/user_flat_compatibility_model")
 MAX_BATCH_SIZE = 500
+DEFAULT_LABEL_NAMES = ["weak", "moderate", "strong"]
 
-app = FastAPI(title="UniMate Flat Scoring API", version="2.0.0")
+app = FastAPI(title="UniMate User-to-Flat Compatibility API", version="3.0.0")
 
 
 class StudentProfile(BaseModel):
@@ -39,18 +45,19 @@ class FlatInput(BaseModel):
     students: list[StudentProfile] = Field(..., min_length=1, max_length=20)
 
 
-class FlatScoreBatchRequest(BaseModel):
+class FlatCompatibilityRequest(BaseModel):
+    current_user: StudentProfile
     flats: list[FlatInput] = Field(..., min_length=1, max_length=MAX_BATCH_SIZE)
-    include_pair_scores: bool = Field(False, description="Include pair-level details for each scored flat")
     sort_descending: bool = Field(True, description="Sort returned flat scores by overall score descending")
 
 
-class FlatScoreEngine:
+class UserFlatCompatibilityEngine:
     def __init__(self, artifact_path: Path, model_dir: Path) -> None:
         if not artifact_path.exists():
             raise FileNotFoundError(f"Artifact not found at {artifact_path}")
+        if not model_dir.exists():
+            raise FileNotFoundError(f"Model directory not found at {model_dir}")
 
-        # Base artifact for encoders and pools
         data: dict[str, Any] = joblib.load(artifact_path)
         self.male_ct = data["male_ct"]
         self.female_ct = data["female_ct"]
@@ -59,111 +66,138 @@ class FlatScoreEngine:
         self.feature_columns = data["feature_columns"]
         self.max_budget_diff = float(data["MAX_BUDGET_DIFF"])
 
-        # Model artifacts
-        self.xgb_model = joblib.load(model_dir / "xgb_model.joblib")
-        with open(model_dir / "feature_names.json", "r") as f:
-            self.xgb_feature_names = json.load(f)
-        with open(model_dir / "thresholds.json", "r") as f:
-            self.thresholds = json.load(f)
+        self.model = joblib.load(model_dir / "compatibility_model.joblib")
+        with open(model_dir / "feature_names.json", "r", encoding="utf-8") as file_obj:
+            self.feature_names = json.load(file_obj)
 
-    def _get_weighted_matrix(self, df: pd.DataFrame, gender: str) -> np.ndarray:
-        if gender.lower() == "male":
-            ct, w = self.male_ct, self.male_w
+        metadata_path = model_dir / "model_metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, "r", encoding="utf-8") as file_obj:
+                self.model_metadata = json.load(file_obj)
         else:
-            ct, w = self.female_ct, self.female_w
+            self.model_metadata = {"label_names": DEFAULT_LABEL_NAMES}
 
-        X = ct.transform(df[self.feature_columns])
-        Xw = X.multiply(w) if sparse.issparse(X) else X * w
-        return Xw.tocsr() if sparse.issparse(Xw) else Xw
+        self.label_names = self.model_metadata.get("label_names", DEFAULT_LABEL_NAMES)
 
-    def score_flat(self, flat: FlatInput) -> dict[str, Any]:
-        students = [s.model_dump() for s in flat.students]
-        
-        # Map pydantic fields to expected feature column names
-        mapping = {
-            "age": "Age",
-            "budget_range": "Budget range",
-            "sleep_code": "sleep_code",
-            "faculty": "Faculty / Study Field",
-            "hometown_governorate": "Hometown Governorate"
-        }
-        
-        # Create DataFrame with correct column names for the transformer
-        df_for_ct = pd.DataFrame([
-            {mapping[k]: v for k, v in s.items() if k in mapping}
-            for s in students
-        ])
-        
-        # Base DataFrame for other logic
-        df = pd.DataFrame(students)
+    def _get_weighted_matrix(self, df: pd.DataFrame, gender: str):
+        if gender.lower() == "male":
+            ct, weights = self.male_ct, self.male_w
+        else:
+            ct, weights = self.female_ct, self.female_w
 
-        # Check gender consistency
-        genders = df["gender"].str.strip().str.capitalize().unique()
-        if len(genders) > 1:
-            return {"error": "Mixed gender groups are not supported for AI scoring"}
-        gender = genders[0]
+        transformed = ct.transform(df[self.feature_columns])
+        weighted = transformed.multiply(weights) if sparse.issparse(transformed) else transformed * weights
+        return weighted.tocsr() if sparse.issparse(weighted) else weighted
 
-        # 1. Base Feature Extraction
-        features = extract_flat_features(students, self.max_budget_diff)
+    def _validate_request(self, current_user: dict[str, Any], flat_students: list[dict[str, Any]]) -> str | None:
+        if not flat_students:
+            return "Flat must contain at least one student."
 
-        # 2. Distance Features
-        X_weighted = self._get_weighted_matrix(df_for_ct, gender)
-        dists = pairwise_distances(X_weighted, metric="euclidean")
-        upper_triangle = dists[np.triu_indices_from(dists, k=1)]
-        
-        features["avg_dist"] = float(np.mean(upper_triangle))
-        features["max_dist"] = float(np.max(upper_triangle))
-        features["min_dist"] = float(np.min(upper_triangle))
-        features["weakest_pair_score"] = 1 / (1 + features["max_dist"])
-        features["penalty_factor"] = features["weakest_pair_score"] ** 2
+        flat_genders = {normalize_gender(student["gender"]) for student in flat_students}
+        if len(flat_genders) > 1:
+            return "Mixed gender flats are not supported for AI scoring."
 
-        # 3. Model Scoring
-        # Ensure features are in the correct order for XGBoost
-        X_input = pd.DataFrame([features])[self.xgb_feature_names]
-        probs = self.xgb_model.predict_proba(X_input)[0] # [weak, moderate, strong]
-        
-        # We define the "overall score" as a weighted sum of probabilities
-        # to provide a continuous scale from 0 to 1
-        overall_score = float(0.0 * probs[0] + 0.5 * probs[1] + 1.0 * probs[2])
-        
-        # Classification
-        # We use the model's direct prediction for the label to maximize accuracy,
-        # but keep the continuous overall_score for UI/sorting.
-        y_pred = int(self.xgb_model.predict(X_input)[0])
-        label_map_inv = {0: "weak", 1: "moderate", 2: "strong"}
-        label = label_map_inv[y_pred]
+        flat_gender = next(iter(flat_genders))
+        if normalize_gender(current_user["gender"]) != flat_gender:
+            return "Current user gender must match the flat residents' gender."
 
-        return {
-            "flat_id": flat.flat_id,
-            "overall_score": round(overall_score, 4),
-            "compatibility_label": label,
-            "probabilities": {
-                "weak": round(float(probs[0]), 4),
-                "moderate": round(float(probs[1]), 4),
-                "strong": round(float(probs[2]), 4)
-            },
-            "metrics": {
-                "avg_budget_diff": round(features["avg_budget_diff"], 4),
-                "avg_sleep_compatibility": round(features["avg_sleep_compat"], 4),
-                "avg_hometown_similarity": round(features["avg_hometown_sim"], 4),
-                "avg_faculty_similarity": round(features["avg_faculty_sim"], 4),
-                "weakest_pair_score": round(features["weakest_pair_score"], 4),
-                "all_pairs_within_budget_threshold": features["budget_pass_rate"] == 1.0
+        current_user_id = str(current_user["student_id"]).strip()
+        flat_student_ids = {str(student["student_id"]).strip() for student in flat_students}
+        if current_user_id in flat_student_ids:
+            return "Current user already exists inside this flat payload."
+
+        return None
+
+    def _build_feature_vector(self, current_user: dict[str, Any], flat_students: list[dict[str, Any]]) -> dict[str, float]:
+        all_students = [current_user, *flat_students]
+        df_for_ct = students_to_transformer_frame(all_students)
+        weighted_matrix = self._get_weighted_matrix(df_for_ct, current_user["gender"])
+
+        user_distances = pairwise_distances(weighted_matrix[0:1], weighted_matrix[1:], metric="euclidean")[0]
+        flat_internal_matrix = pairwise_distances(weighted_matrix[1:], metric="euclidean")
+        combined_matrix = pairwise_distances(weighted_matrix, metric="euclidean")
+
+        user_flat_features = extract_user_flat_features(current_user, flat_students, self.max_budget_diff)
+        user_distance_stats = summarize_distance_values(user_distances)
+        flat_distance_stats = summarize_distance_values(flat_internal_matrix[np.triu_indices_from(flat_internal_matrix, k=1)])
+        combined_distance_stats = summarize_distance_values(combined_matrix[np.triu_indices_from(combined_matrix, k=1)])
+
+        user_flat_features.update(
+            {
+                "user_distance_mean": user_distance_stats["mean"],
+                "user_distance_min": user_distance_stats["min"],
+                "user_distance_max": user_distance_stats["max"],
+                "flat_distance_mean": flat_distance_stats["mean"],
+                "flat_distance_min": flat_distance_stats["min"],
+                "flat_distance_max": flat_distance_stats["max"],
+                "combined_distance_mean": combined_distance_stats["mean"],
+                "combined_distance_min": combined_distance_stats["min"],
+                "combined_distance_max": combined_distance_stats["max"],
+                "combined_weakest_link_score": 1.0 / (1.0 + combined_distance_stats["max"]),
+                "delta_distance_mean": combined_distance_stats["mean"] - flat_distance_stats["mean"],
             }
-        }
+        )
+        return user_flat_features
 
-    def score_batch(self, payload: FlatScoreBatchRequest) -> dict[str, Any]:
-        scored_flats = []
-        rejected_flats = []
+    def score_flat_for_user(self, current_user: StudentProfile, flat: FlatInput) -> dict[str, Any]:
+        try:
+            user_dict = canonicalize_student(current_user.model_dump())
+            flat_students = [canonicalize_student(student.model_dump()) for student in flat.students]
+            validation_error = self._validate_request(user_dict, flat_students)
+            if validation_error:
+                return {"error": validation_error}
+
+            features = self._build_feature_vector(user_dict, flat_students)
+            feature_frame = pd.DataFrame([features]).reindex(columns=self.feature_names, fill_value=0.0)
+            probabilities = self.model.predict_proba(feature_frame)[0]
+            predicted_index = int(self.model.predict(feature_frame)[0])
+            predicted_label = self.label_names[predicted_index]
+            overall_score = float(0.0 * probabilities[0] + 0.5 * probabilities[1] + 1.0 * probabilities[2])
+
+            return {
+                "flat_id": flat.flat_id,
+                "status": "scored",
+                "overall_score": round(overall_score, 4),
+                "compatibility_label": predicted_label,
+                "probabilities": {
+                    label: round(float(probability), 4)
+                    for label, probability in zip(self.label_names, probabilities)
+                },
+                "metrics": {
+                    "flat_size": int(features["flat_size"]),
+                    "user_budget_diff_mean": round(features["user_budget_diff_mean"], 4),
+                    "user_sleep_compat_mean": round(features["user_sleep_compat_mean"], 4),
+                    "user_hometown_sim_mean": round(features["user_hometown_sim_mean"], 4),
+                    "user_faculty_sim_mean": round(features["user_faculty_sim_mean"], 4),
+                    "user_distance_mean": round(features["user_distance_mean"], 4),
+                    "user_distance_max": round(features["user_distance_max"], 4),
+                    "flat_distance_mean": round(features["flat_distance_mean"], 4),
+                    "combined_distance_mean": round(features["combined_distance_mean"], 4),
+                    "combined_weakest_link_score": round(features["combined_weakest_link_score"], 4),
+                    "user_budget_fit_pass_rate": round(features["user_budget_pass_rate"], 4),
+                },
+                "notes": [
+                    "Score reflects how well the current user matches the residents already inside this flat.",
+                    "Flat internal cohesion is used only as context, not as the final target being scored.",
+                ],
+            }
+        except Exception as exc:
+            return {"error": f"Scoring failed safely for this flat: {exc}"}
+
+    def score_batch(self, payload: FlatCompatibilityRequest) -> dict[str, Any]:
+        scored_flats: list[dict[str, Any]] = []
+        rejected_flats: list[dict[str, Any]] = []
 
         for flat in payload.flats:
-            result = self.score_flat(flat)
+            result = self.score_flat_for_user(payload.current_user, flat)
             if "error" in result:
-                rejected_flats.append({
-                    "flat_id": flat.flat_id,
-                    "status": "rejected",
-                    "reason": result["error"]
-                })
+                rejected_flats.append(
+                    {
+                        "flat_id": flat.flat_id,
+                        "status": "rejected",
+                        "reason": result["error"],
+                    }
+                )
             else:
                 scored_flats.append(result)
 
@@ -171,6 +205,7 @@ class FlatScoreEngine:
             scored_flats.sort(key=lambda item: item["overall_score"], reverse=True)
 
         return {
+            "current_user_id": payload.current_user.student_id,
             "request_count": len(payload.flats),
             "scored_count": len(scored_flats),
             "rejected_count": len(rejected_flats),
@@ -180,10 +215,10 @@ class FlatScoreEngine:
 
 
 @lru_cache(maxsize=1)
-def get_engine() -> FlatScoreEngine:
-    return FlatScoreEngine(ARTIFACT_PATH, FLAT_MODEL_DIR)
+def get_engine() -> UserFlatCompatibilityEngine:
+    return UserFlatCompatibilityEngine(ARTIFACT_PATH, MODEL_DIR)
 
 
 @app.post("/flat-scores")
-def score_all_flats(payload: FlatScoreBatchRequest):
+def score_all_flats(payload: FlatCompatibilityRequest):
     return get_engine().score_batch(payload)

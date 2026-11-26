@@ -1,114 +1,92 @@
-# UniMate — Flat Compatibility Scoring API
+# UniMate — User-to-Flat Compatibility API
 
-UniMate is an AI-powered student housing platform. This repository is its **scoring API**: given the students who would share a flat, it predicts how well they would live together and returns a compatibility label, a score from 0 to 1, and the reasons behind it.
+UniMate is an AI-powered student housing platform. This repository is its **compatibility engine**: for a student looking for housing, it scores how well they would fit with the residents already living in each available flat, then ranks the flats.
 
-Built with **FastAPI**, **XGBoost**, and **scikit-learn**.
+Built with **FastAPI**, **XGBoost**, and **scikit-learn**. Deployed on Hugging Face Spaces: [lixmed/unimate-ai](https://huggingface.co/spaces/lixmed/unimate-ai).
 
 ## Results
 
-| Metric | Train | Test |
-|---|---|---|
-| Accuracy | 98.87% | **98.37%** |
-| F1 score | 0.989 | **0.984** |
+| Metric | Value |
+|---|---|
+| Holdout accuracy | **97.29%** (1,440 holdout cases) |
+| 95% confidence interval | 96.46% – 97.99% (bootstrap) |
+| Weighted F1 | 0.973 |
+| Weighted one-vs-rest ROC-AUC | 0.998 |
+| Validation accuracy | 95.49% |
 
-Train/test gap: 0.5%, so the model generalizes instead of memorizing.
+Per class: weak F1 0.980, moderate F1 0.962, strong F1 0.977. The full report with charts (confusion matrix, ROC and PR curves, loss curve, accuracy by flat size, feature importance) is in [`reports/user_flat_compatibility/UNIMATE_COMPATIBILITY_REPORT.md`](reports/user_flat_compatibility/UNIMATE_COMPATIBILITY_REPORT.md).
 
 ## How it works
 
-1. **Student profiles.** Each student has a gender, age, budget range, sleep schedule, faculty, hometown governorate, and whether they want a roommate. Inputs are validated with Pydantic (for example, age 17–40, budget 0–1).
-2. **Pairwise compatibility.** For every pair of students in the flat, the API computes:
-   - budget difference, and whether the pair is within the budget threshold
-   - sleep schedule compatibility
-   - age difference
-   - hometown similarity: same governorate, same region of Egypt (e.g. Greater Cairo, Delta, Upper Egypt), or neither
-   - faculty similarity: same faculty, same field cluster (STEM, Medical, Humanities), or neither
-3. **Weighted distance features.** Profiles are encoded with gender-specific transformers and feature weights; pairwise Euclidean distances give the average, closest, and weakest pair in the flat.
-4. **Flat-level features.** Pair features are aggregated into 14 flat-level features (averages, age span, budget–sleep interaction, a penalty for the weakest pair).
-5. **XGBoost classifier.** Predicts **weak / moderate / strong** compatibility. The class probabilities are also combined into a continuous `overall_score` (0–1) so flats can be ranked.
+```
+current user ─┐
+              ├─▶ user-to-flat feature builder ─▶ distance + social-fit features ─▶ XGBoost ─▶ weak / moderate / strong ─▶ score + ranking
+flat residents┘
+```
+
+1. **Profiles.** Each student has a gender, age, budget range, sleep schedule, faculty, and hometown governorate. Inputs are validated with Pydantic.
+2. **User-to-resident signals.** Budget difference, sleep compatibility, age difference, hometown similarity (same governorate, same region of Egypt, or neither), and faculty similarity (same faculty, same field cluster, or neither).
+3. **Encoded distances.** Profiles are encoded with gender-specific transformers and feature weights; distances between the user and each resident are summarized (mean, min, max).
+4. **Flat context.** The flat's own cohesion (before and after the user joins) is used as context, not as the target.
+5. **XGBoost classifier** (multiclass log loss) predicts weak / moderate / strong; the probabilities give a continuous `overall_score` used to rank flats.
+
+Top drivers: flat distance mean, combined distance mean, minimum sleep compatibility in the flat, and the user's closest resident distance.
+
+## Training and evaluation
+
+- `train_flat_model.py` builds a labelled dataset of flats of size 1–6 from the student pool (cohesive and random flats for each class), trains the XGBoost model with stratified validation, and saves the model, feature list, metadata, and a training data snapshot to `artifacts/user_flat_compatibility_model/`.
+- `evaluate_flats.py` scores a separate holdout set (different random seed), computes metrics with a bootstrap confidence interval, draws the charts, and writes the report in `reports/user_flat_compatibility/`.
 
 ## API
 
 ### `POST /flat-scores`
 
-Scores up to **500 flats** in one request, each with up to **20 students**. Flats are sorted by score (best first) by default. Mixed-gender flats are returned under `rejected_flats` with a reason.
-
-**Request**
-
 ```json
 {
+  "current_user": {
+    "student_id": "demo_user_001", "gender": "Male", "age": 21, "budget_range": 0.05,
+    "sleep_code": 1, "faculty": "Faculty of Computers and Artificial Intelligence",
+    "hometown_governorate": "Cairo", "wants_roommate": 1
+  },
   "flats": [
-    {
-      "flat_id": "flat-1",
-      "students": [
-        {"student_id": "s1", "gender": "Male", "age": 20, "budget_range": 0.4, "sleep_code": 1,
-         "faculty": "Faculty of Computers and Artificial Intelligence", "hometown_governorate": "Fayoum"},
-        {"student_id": "s2", "gender": "Male", "age": 21, "budget_range": 0.5, "sleep_code": 1,
-         "faculty": "Faculty of Engineering", "hometown_governorate": "Beni Suef"}
-      ]
-    }
+    {"flat_id": "demo_flat_1", "students": [
+      {"student_id": "flat_member_1", "gender": "Male", "age": 22, "budget_range": 0.066,
+       "sleep_code": 2, "faculty": "Faculty of Computers and Artificial Intelligence",
+       "hometown_governorate": "Cairo", "wants_roommate": 1}
+    ]}
   ],
   "sort_descending": true
 }
 ```
 
-**Response** (shape)
-
-```json
-{
-  "request_count": 1,
-  "scored_count": 1,
-  "rejected_count": 0,
-  "flat_scores": [
-    {
-      "flat_id": "flat-1",
-      "overall_score": 0.0,
-      "compatibility_label": "strong | moderate | weak",
-      "probabilities": {"weak": 0.0, "moderate": 0.0, "strong": 0.0},
-      "metrics": {
-        "avg_budget_diff": 0.0,
-        "avg_sleep_compatibility": 0.0,
-        "avg_hometown_similarity": 0.0,
-        "avg_faculty_similarity": 0.0,
-        "weakest_pair_score": 0.0,
-        "all_pairs_within_budget_threshold": true
-      }
-    }
-  ],
-  "rejected_flats": []
-}
-```
-
-Interactive docs are available at `/docs` once the server is running.
+Each scored flat returns an `overall_score`, a `compatibility_label`, class `probabilities`, explanatory `metrics` (budget, sleep, hometown and faculty fit, distances, weakest link), and notes. Interactive docs are at `/docs`.
 
 ## Run locally
 
 ```bash
 git clone https://github.com/lixmed/unimate-api.git
 cd unimate-api
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn api:app --reload
-```
+uvicorn api:app --reload        # http://127.0.0.1:8000/docs
 
-Then open http://127.0.0.1:8000/docs.
+python train_flat_model.py      # optional: retrain
+python evaluate_flats.py        # optional: regenerate the report
+```
 
 ## Project structure
 
 ```
 .
-├── api.py               # FastAPI app, request validation, scoring engine
-├── model_utils.py       # pairwise feature extraction (budget, sleep, age, hometown, faculty)
-├── requirements.txt
-└── artifacts/
-    ├── unimate_matcher.joblib     # encoders and gender-specific feature weights
-    └── flat_model/
-        ├── xgb_model.joblib       # trained XGBoost classifier
-        ├── feature_names.json     # feature order expected by the model
-        ├── thresholds.json        # score thresholds for moderate / strong
-        └── robustness_metrics.json
+├── api.py                 # FastAPI app and scoring engine
+├── model_utils.py         # profile canonicalization and feature extraction
+├── train_flat_model.py    # dataset generation and training
+├── evaluate_flats.py      # holdout evaluation and report
+├── artifacts/
+│   ├── unimate_matcher.joblib            # encoders, feature weights, student pools
+│   └── user_flat_compatibility_model/    # XGBoost model, features, metadata, data snapshot
+└── reports/user_flat_compatibility/      # metrics, charts, full report
 ```
 
 ## Tech stack
 
-Python · FastAPI · Pydantic · XGBoost · scikit-learn · pandas · NumPy · SciPy · joblib
+Python · FastAPI · Pydantic · XGBoost · scikit-learn · pandas · NumPy · SciPy · Matplotlib · Hugging Face Spaces
